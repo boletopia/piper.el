@@ -133,6 +133,8 @@ The file is stored in the system's temporary directory."
 The raw audio is saved to a unique file based on the text."
   (let* ((escaped-text (replace-regexp-in-string "'" "'\\''" text))
          (unique-filename (piper--generate-unique-filename text))) ;; Generate unique filename
+    (setq piper-temp-file unique-filename) ;; Update `piper-temp-file` with unique filename
+    (message "Generated Piper audio file: %s" piper-temp-file) ;; Debugging
     ;; If the file already exists, skip generation and replay it
     (if (file-exists-p unique-filename)
         (progn
@@ -190,21 +192,24 @@ Returns t if the user agrees, and nil otherwise."
 
 (defun piper--start-aplay-process (filename)
   "Start the `aplay` process to play the given FILENAME and add it to the queue."
-  (let ((process
-         (start-process "piper-aplay-process" nil "aplay"
-                        "-r" "22050" "-f" "S16_LE" "-t" "raw" filename))) ;; Use filename directly
-    ;; Add the `aplay` process to the queue
-    (piper--enqueue-process process 'aplay)
-    ;; Set up a sentinel for cleanup
-    (set-process-sentinel
-     process
-     (lambda (process event)
-       (if (string= event "finished\n")
-           (message "Playback finished successfully.")
-         (message "Playback failed or was terminated: %s" event))
-       ;; Remove the `aplay` process from the queue
-       (piper--dequeue-process process)))
-    (message "Started playback with `aplay`: %s" filename)))
+  (message "Starting playback with file: %s" filename) ;; Debugging
+  (if (not (and (file-exists-p filename) (> (file-attribute-size (file-attributes filename)) 0)))
+      (message "Playback failed: Audio file %s is missing or empty." filename)
+    (let ((process
+           (start-process "piper-aplay-process" nil "aplay"
+                          "-r" "22050" "-f S16_LE" "-t raw" filename)))
+      ;; Add the `aplay` process to the queue
+      (piper--enqueue-process process 'aplay)
+      ;; Set up a sentinel for cleanup
+      (set-process-sentinel
+       process
+       (lambda (process event)
+         (if (string= event "finished\n")
+             (message "Playback finished successfully.")
+           (message "Playback failed or was terminated: %s" event))
+         ;; Remove the `aplay` process from the queue
+         (piper--dequeue-process process)))
+      (message "Started playback with `aplay`: %s" filename))))
 
 ;; Something is still wrong with this play queue thing
 (defun piper--run-process (text)
