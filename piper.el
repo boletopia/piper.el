@@ -47,13 +47,30 @@
   "Text-to-Speech interface using Piper."
   :group 'external)
 
-(defcustom piper-binary-path "/home/yizhe/Src/piper/piper/piper"
-  "Path to the Piper binary."
+(defcustom piper-install-directory "/home/yizhe/Src/piper/piper/"
+  "Base directory where Piper is installed.
+This directory should contain the Piper binary and model files.
+User should download or compile their relevent binary from
+https://github.com/rhasspy/piper"
+  :type 'directory
+  :group 'piper)
+
+(defcustom piper-model-name "en_US-lessac-high"
+  "Name of the Piper model to use (without file extension).
+The model file must exist in the `models` subdirectory of `piper-install-directory`."
+  :type 'string
+  :group 'piper)
+
+(defcustom piper-binary-path (concat piper-install-directory "piper")
+  "Path to the Piper binary.
+This path is derived from `piper-install-directory` by default."
   :type 'file
   :group 'piper)
 
-(defcustom piper-model-path "/home/yizhe/Src/piper/piper/models/en_US-lessac-high.onnx"
-  "Path to the Piper model file."
+(defcustom piper-model-path
+  (concat piper-install-directory "models/" piper-model-name ".onnx")
+  "Path to the Piper model file.
+This path is dynamically derived from `piper-install-directory` and `piper-model-name`."
   :type 'file
   :group 'piper)
 
@@ -78,17 +95,25 @@
   :type 'boolean
   :group 'piper)
 
-(defcustom piper-tooltip-height 200
-  "Height of the tooltip text when `piper-mode` is active, in units of 1/10 point."
-  :type 'integer
+(defcustom piper-fifo-mode t
+  "If non-nil, use a First-In-First-Out (FIFO) model to stop Piper processes.
+When a new process is started, the oldest process in the queue is stopped automatically."
+  :type 'boolean
   :group 'piper)
 
 ;;; Internal variables
 
-(defvar piper--stdout-buffer-name "*piper-stdout*")
-(defvar piper--stderr-buffer-name "*piper-stderr*")
-(defvar piper--original-tooltip-height nil
-  "Stores the original `showkey-tooltip-height` value to restore when `piper-mode` is disabled.")
+(defvar piper--process nil
+  "Reference to the current Piper process, if any.")
+
+(defvar piper--process-queue nil
+  "Queue to track all currently running Piper processes.")
+
+(defvar piper--stdout-buffer-name "*piper-stdout*"
+  "Buffer name for Piper's stdout.")
+
+(defvar piper--stderr-buffer-name "*piper-stderr*"
+  "Buffer name for Piper's stderr.")
 
 ;;; Utility functions
 
@@ -110,21 +135,65 @@
                   (shell-quote-argument piper-model-path)
                   piper-aplay-parameters))))
 
+(defun piper--enqueue-process (process)
+  "Add PROCESS to the Piper process queue."
+  (push process piper--process-queue))
+
+(defun piper--dequeue-process ()
+  "Remove and return the oldest process in the Piper process queue."
+  (let ((oldest-process (car (last piper--process-queue))))
+    (setq piper--process-queue (butlast piper--process-queue))
+    oldest-process))
+
+(defun piper--stop-oldest-process ()
+  "Stop the oldest running Piper process in the queue."
+  (let ((oldest-process (piper--dequeue-process)))
+    (when (and oldest-process (process-live-p oldest-process))
+      (delete-process oldest-process)
+      (message "Stopped the oldest Piper process: %s" (process-name oldest-process)))))
+
+(defun piper--confirm-and-stop-if-needed ()
+  "Check if a Piper process is running and confirm with the user to stop it.
+If `piper-fifo-mode` is enabled, automatically stop the oldest process."
+  (when piper--process-queue
+    (if piper-fifo-mode
+        (piper--stop-oldest-process)
+      (if (yes-or-no-p "A Piper process is already running. Stop it?")
+          (piper--stop-oldest-process)
+        (error "Cannot start a new Piper process while another is running.")))))
+
+(defun piper--confirm-multiple-processes ()
+  "Ask the user to confirm if they want to allow multiple Piper processes to run.
+Returns t if the user agrees, and nil otherwise."
+  (yes-or-no-p "A Piper process is already running. Do you want to allow another process to run?"))
+
 (defun piper--run-process (text)
   "Run the Piper process with the given TEXT."
-  (let ((command (piper--build-command text)))
-    (make-process
-     :name "piper-process"
-     :command command
-     :connection-type nil
-     :buffer (if piper-show-process-output
-                 (get-buffer-create piper--stdout-buffer-name)
-               nil)
-     :stderr (get-buffer-create piper--stderr-buffer-name)
-     :sentinel (lambda (_process event)
-                 (if (string= event "finished\n")
-                     (message "Piper process finished successfully.")
-                   (message "Piper process failed: %s" event))))))
+  (when (and piper--process-queue (not (piper--confirm-multiple-processes)))
+    (error "Cannot start a new Piper process while another is running."))
+  (let ((command (piper--build-command text))
+        (process nil))
+    (setq process
+          (make-process
+           :name "piper-process"
+           :command command
+           :connection-type nil
+           :buffer (if piper-show-process-output
+                       (get-buffer-create piper--stdout-buffer-name)
+                     nil)
+           :stderr (get-buffer-create piper--stderr-buffer-name)
+           :sentinel (lambda (process event)
+                       (if (string= event "finished\n")
+                           (progn
+                             (message "Piper process finished successfully.")
+                             (setq piper--process-queue
+                                   (delq process piper--process-queue)))
+                         (progn
+                           (message "Piper process failed: %s" event)
+                           (setq piper--process-queue
+                                 (delq process piper--process-queue)))))))
+    (piper--enqueue-process process)
+    (message "Piper process started: %s" (process-name process))))
 
 ;;; Main functions
 
@@ -149,11 +218,19 @@
     (message "Sending file contents to Piper for TTS...")
     (piper--run-process text)))
 
-(defun piper--speak-current-char ()
-  "Speak the character just typed."
-  (let ((char (char-before)))
-    (when (and char (characterp char))
-      (piper-speak-letter char))))
+;;; Stop Piper process
+
+(defun piper-stop ()
+  "Stop the oldest running Piper process, if any.
+If multiple processes are running, it uses the FIFO model and stops the oldest."
+  (interactive)
+  (if piper--process-queue
+      (let ((process (piper--dequeue-process))) ;; Get the oldest process from the queue
+        (when (process-live-p process)
+          (delete-process process)
+          (message "Stopped Piper process: %s" (process-name process))))
+    (message "No Piper process is currently running.")))
+
 
 (provide 'piper)
 ;;; piper.el ends here
